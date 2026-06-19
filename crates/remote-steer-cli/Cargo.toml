@@ -13,6 +13,7 @@ remote-steer-backend-linux.workspace = true
 remote-steer-backend-windows.workspace = true
 remote-steer-core.workspace = true
 remote-steer-transport.workspace = true
+serde.workspace = true
 serde_json.workspace = true
 tokio.workspace = true
 tracing.workspace = true

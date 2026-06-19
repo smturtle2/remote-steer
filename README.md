@@ -32,16 +32,27 @@ support yet.
 
 ## Quick Start
 
-Run the server on the Windows machine with the real wheel attached:
+Run the server once on the Windows machine with the real wheel attached:
 
 ```sh
 remote-steer server --token <shared-token>
 ```
 
-Run the client on the Linux machine where the game runs:
+Run the client once on the Linux machine where the game runs:
 
 ```sh
 remote-steer client <windows-host-or-ip> --token <shared-token>
+```
+
+After the first successful connection, `remote-steer` remembers the server and
+token. Daily use becomes:
+
+```sh
+# Windows wheel machine
+remote-steer server
+
+# Linux game machine
+remote-steer client
 ```
 
 The Linux side creates a virtual Thrustmaster T150 input device. Start the game
@@ -52,13 +63,13 @@ after the client is connected and select the virtual wheel.
 To test force feedback directly through the remote Windows wheel server:
 
 ```sh
-remote-steer test <windows-host-or-ip> --token <shared-token>
+remote-steer test
 ```
 
 To play one preset and exit:
 
 ```sh
-remote-steer test <windows-host-or-ip> --token <shared-token> --effect engine
+remote-steer test --effect engine
 ```
 
 The test menu includes the same style of named effects exposed by the
@@ -98,13 +109,18 @@ cargo build --release --target x86_64-pc-windows-gnu -p remote-steer
 
 ```sh
 remote-steer server --token <shared-token>
+remote-steer server
 remote-steer client <server-host-or-ip> --token <shared-token>
-remote-steer test <server-host-or-ip> --token <shared-token>
-remote-steer test <server-host-or-ip> --token <shared-token> --effect engine
+remote-steer client
+remote-steer test
+remote-steer test --effect engine
 remote-steer probe physical
 remote-steer probe virtual
 remote-steer dump-direct-input
 ```
+
+Connection defaults are saved after a successful first run. Override them with
+`REMOTE_STEER_SERVER`, `REMOTE_STEER_TOKEN`, or `REMOTE_STEER_CONFIG`.
 
 The old `physical`, `virtual`, and `test-ffb` subcommands remain as hidden
 compatibility commands. New users should use `server`, `client`, and `test`.
