@@ -39,9 +39,6 @@ const DIDFT_AXIS_ANY_OPTIONAL: u32 = 0x80ff_ff03;
 const DIDFT_BUTTON_ANY_OPTIONAL: u32 = 0x80ff_ff0c;
 const DIDFT_POV_ANY_OPTIONAL: u32 = 0x80ff_ff10;
 const DATA_FORMAT_ASPECT_POSITION: u32 = 0x0001_0000;
-const DATA_FORMAT_ASPECT_VELOCITY: u32 = 0x0002_0000;
-const DATA_FORMAT_ASPECT_ACCEL: u32 = 0x0003_0000;
-const DATA_FORMAT_ASPECT_FORCE: u32 = 0x0004_0000;
 
 pub struct WindowsPhysicalBackend {
     _com: ComApartment,
@@ -851,7 +848,6 @@ fn configure_device(device: &IDirectInputDevice8W, hwnd: HWND) -> Result<u32> {
 
         try_set_axis_range(device, offset_u32(offset_of!(DIJOYSTATE2, lX)), 0, 65535);
         try_set_axis_range(device, offset_u32(offset_of!(DIJOYSTATE2, lY)), 0, 255);
-        try_set_axis_range(device, offset_u32(offset_of!(DIJOYSTATE2, lZ)), 0, 255);
         try_set_axis_range(device, offset_u32(offset_of!(DIJOYSTATE2, lRz)), 0, 255);
         try_set_axis_range(
             device,
@@ -880,21 +876,31 @@ fn configure_device(device: &IDirectInputDevice8W, hwnd: HWND) -> Result<u32> {
 }
 
 fn joystick2_object_format() -> Vec<DIOBJECTDATAFORMAT> {
-    let mut objects = Vec::with_capacity(164);
-    push_axis_group(
-        &mut objects,
+    let mut objects = Vec::with_capacity(136);
+    objects.push(object_format(
+        &GUID_XAxis,
+        offset_u32(offset_of!(DIJOYSTATE2, lX)),
+        DIDFT_AXIS_ANY_OPTIONAL,
         DATA_FORMAT_ASPECT_POSITION,
-        [
-            offset_u32(offset_of!(DIJOYSTATE2, lX)),
-            offset_u32(offset_of!(DIJOYSTATE2, lY)),
-            offset_u32(offset_of!(DIJOYSTATE2, lZ)),
-            offset_u32(offset_of!(DIJOYSTATE2, lRx)),
-            offset_u32(offset_of!(DIJOYSTATE2, lRy)),
-            offset_u32(offset_of!(DIJOYSTATE2, lRz)),
-            offset_u32(offset_of!(DIJOYSTATE2, rglSlider)),
-            offset_u32(offset_of!(DIJOYSTATE2, rglSlider) + size_of::<i32>()),
-        ],
-    );
+    ));
+    objects.push(object_format(
+        &GUID_YAxis,
+        offset_u32(offset_of!(DIJOYSTATE2, lY)),
+        DIDFT_AXIS_ANY_OPTIONAL,
+        DATA_FORMAT_ASPECT_POSITION,
+    ));
+    objects.push(object_format(
+        &GUID_RzAxis,
+        offset_u32(offset_of!(DIJOYSTATE2, lRz)),
+        DIDFT_AXIS_ANY_OPTIONAL,
+        DATA_FORMAT_ASPECT_POSITION,
+    ));
+    objects.push(object_format(
+        &GUID_Slider,
+        offset_u32(offset_of!(DIJOYSTATE2, rglSlider)),
+        DIDFT_AXIS_ANY_OPTIONAL,
+        DATA_FORMAT_ASPECT_POSITION,
+    ));
 
     for index in 0..4 {
         objects.push(object_format(
@@ -914,66 +920,7 @@ fn joystick2_object_format() -> Vec<DIOBJECTDATAFORMAT> {
         ));
     }
 
-    push_axis_group(
-        &mut objects,
-        DATA_FORMAT_ASPECT_VELOCITY,
-        [
-            offset_u32(offset_of!(DIJOYSTATE2, lVX)),
-            offset_u32(offset_of!(DIJOYSTATE2, lVY)),
-            offset_u32(offset_of!(DIJOYSTATE2, lVZ)),
-            offset_u32(offset_of!(DIJOYSTATE2, lVRx)),
-            offset_u32(offset_of!(DIJOYSTATE2, lVRy)),
-            offset_u32(offset_of!(DIJOYSTATE2, lVRz)),
-            offset_u32(offset_of!(DIJOYSTATE2, rglSlider)),
-            offset_u32(offset_of!(DIJOYSTATE2, rglSlider) + size_of::<i32>()),
-        ],
-    );
-    push_axis_group(
-        &mut objects,
-        DATA_FORMAT_ASPECT_ACCEL,
-        [
-            offset_u32(offset_of!(DIJOYSTATE2, lAX)),
-            offset_u32(offset_of!(DIJOYSTATE2, lAY)),
-            offset_u32(offset_of!(DIJOYSTATE2, lAZ)),
-            offset_u32(offset_of!(DIJOYSTATE2, lARx)),
-            offset_u32(offset_of!(DIJOYSTATE2, lARy)),
-            offset_u32(offset_of!(DIJOYSTATE2, lARz)),
-            offset_u32(offset_of!(DIJOYSTATE2, rglSlider)),
-            offset_u32(offset_of!(DIJOYSTATE2, rglSlider) + size_of::<i32>()),
-        ],
-    );
-    push_axis_group(
-        &mut objects,
-        DATA_FORMAT_ASPECT_FORCE,
-        [
-            offset_u32(offset_of!(DIJOYSTATE2, lFX)),
-            offset_u32(offset_of!(DIJOYSTATE2, lFY)),
-            offset_u32(offset_of!(DIJOYSTATE2, lFZ)),
-            offset_u32(offset_of!(DIJOYSTATE2, lFRx)),
-            offset_u32(offset_of!(DIJOYSTATE2, lFRy)),
-            offset_u32(offset_of!(DIJOYSTATE2, lFRz)),
-            offset_u32(offset_of!(DIJOYSTATE2, rglSlider)),
-            offset_u32(offset_of!(DIJOYSTATE2, rglSlider) + size_of::<i32>()),
-        ],
-    );
-
     objects
-}
-
-fn push_axis_group(objects: &mut Vec<DIOBJECTDATAFORMAT>, flags: u32, offsets: [u32; 8]) {
-    let guids = [
-        &GUID_XAxis,
-        &GUID_YAxis,
-        &GUID_ZAxis,
-        &GUID_RxAxis,
-        &GUID_RyAxis,
-        &GUID_RzAxis,
-        &GUID_Slider,
-        &GUID_Slider,
-    ];
-    for (guid, offset) in guids.into_iter().zip(offsets) {
-        objects.push(object_format(guid, offset, DIDFT_AXIS_ANY_OPTIONAL, flags));
-    }
 }
 
 fn object_format(guid: &GUID, offset: u32, data_type: u32, flags: u32) -> DIOBJECTDATAFORMAT {
@@ -1258,7 +1205,7 @@ fn snapshot_from_dijoystate(seq: u64, state: &DIJOYSTATE2) -> WheelStateSnapshot
             },
             AxisValue {
                 axis: AxisKind::Throttle,
-                value: state.lZ,
+                value: state.rglSlider[0],
             },
             AxisValue {
                 axis: AxisKind::HatX,
@@ -1424,4 +1371,59 @@ fn is_not_implemented_error(error: &windows::core::Error) -> bool {
 
 fn windows_error(context: &str, error: windows::core::Error) -> RemoteSteerError {
     RemoteSteerError::Backend(format!("{context}: {error}"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn t150_snapshot_uses_slider_for_throttle() {
+        let mut state = DIJOYSTATE2 {
+            lX: 111,
+            lY: 22,
+            lZ: 99,
+            lRz: 33,
+            ..Default::default()
+        };
+        state.rglSlider[0] = 44;
+
+        let snapshot = snapshot_from_dijoystate(7, &state);
+
+        assert_eq!(snapshot.axis(AxisKind::Wheel), Some(111));
+        assert_eq!(snapshot.axis(AxisKind::PedalY), Some(22));
+        assert_eq!(snapshot.axis(AxisKind::PedalRz), Some(33));
+        assert_eq!(snapshot.axis(AxisKind::Throttle), Some(44));
+    }
+
+    #[test]
+    fn t150_data_format_uses_only_present_position_axes() {
+        let objects = joystick2_object_format();
+        let axis_objects: Vec<&DIOBJECTDATAFORMAT> = objects
+            .iter()
+            .filter(|object| object.dwType == DIDFT_AXIS_ANY_OPTIONAL)
+            .collect();
+
+        assert_eq!(objects.len(), 136);
+        assert_eq!(axis_objects.len(), 4);
+        assert_eq!(
+            axis_objects[0].dwOfs,
+            offset_u32(offset_of!(DIJOYSTATE2, lX))
+        );
+        assert_eq!(
+            axis_objects[1].dwOfs,
+            offset_u32(offset_of!(DIJOYSTATE2, lY))
+        );
+        assert_eq!(
+            axis_objects[2].dwOfs,
+            offset_u32(offset_of!(DIJOYSTATE2, lRz))
+        );
+        assert_eq!(
+            axis_objects[3].dwOfs,
+            offset_u32(offset_of!(DIJOYSTATE2, rglSlider))
+        );
+        assert!(axis_objects
+            .iter()
+            .all(|object| object.dwFlags == DATA_FORMAT_ASPECT_POSITION));
+    }
 }

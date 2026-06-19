@@ -11,10 +11,10 @@ use input_linux::{
     InputId, Key, UInputHandle,
 };
 use remote_steer_core::{
-    profile_by_id, AxisValue, BackendCapabilities, ButtonValue, ConditionAxis, ConditionKind,
-    EffectId, FfbCommand, FfbCommandKind, FfbEffect, FfbEffectKind, FfbEnvelope, FfbReplay,
-    FfbReply, FfbReplyKind, PeriodicWaveform, PhysicalWheelBackend, RemoteSteerError, Result,
-    VirtualWheelBackend, WheelProfileId, WheelStateSnapshot,
+    profile_by_id, AxisKind, AxisValue, BackendCapabilities, ButtonValue, ConditionAxis,
+    ConditionKind, EffectId, FfbCommand, FfbCommandKind, FfbEffect, FfbEffectKind, FfbEnvelope,
+    FfbReplay, FfbReply, FfbReplyKind, PeriodicWaveform, PhysicalWheelBackend, RemoteSteerError,
+    Result, VirtualWheelBackend, WheelProfileId, WheelStateSnapshot,
 };
 use tracing::debug;
 
@@ -35,6 +35,8 @@ pub struct LinuxVirtualBackend {
     pending_erases: HashMap<u64, sys::uinput_ff_erase>,
     pending_commands: VecDeque<FfbCommand>,
     next_command_seq: u64,
+    last_axes: HashMap<AxisKind, i32>,
+    last_buttons: HashMap<u16, bool>,
 }
 
 #[derive(Debug, Clone)]
@@ -127,6 +129,8 @@ impl LinuxVirtualBackend {
             pending_erases: HashMap::new(),
             pending_commands: VecDeque::new(),
             next_command_seq: 0,
+            last_axes: HashMap::new(),
+            last_buttons: HashMap::new(),
         })
     }
 
@@ -181,25 +185,15 @@ impl VirtualWheelBackend for LinuxVirtualBackend {
     }
 
     fn inject_input(&mut self, snapshot: WheelStateSnapshot) -> Result<()> {
-        let mut events = Vec::with_capacity(snapshot.axes.len() + snapshot.buttons.len() + 1);
-        for axis in snapshot.axes {
-            let code = self
-                .profile
-                .axes
-                .iter()
-                .find(|profile| profile.kind == axis.axis)
-                .ok_or_else(|| RemoteSteerError::Backend(format!("unknown axis {:?}", axis.axis)))?
-                .linux_code;
-            events.push(raw_event(sys::EV_ABS as u16, code, axis.value));
+        let events = input_events_for_snapshot(
+            &self.profile,
+            &mut self.last_axes,
+            &mut self.last_buttons,
+            snapshot,
+        )?;
+        if events.is_empty() {
+            return Ok(());
         }
-        for button in snapshot.buttons {
-            events.push(raw_event(
-                sys::EV_KEY as u16,
-                button.linux_code,
-                i32::from(button.pressed),
-            ));
-        }
-        events.push(raw_event(sys::EV_SYN as u16, sys::SYN_REPORT as u16, 0));
         self.handle.write(&events)?;
         Ok(())
     }
@@ -325,6 +319,55 @@ impl VirtualWheelBackend for LinuxVirtualBackend {
         }
         Ok(())
     }
+}
+
+fn input_events_for_snapshot(
+    profile: &remote_steer_core::WheelProfile,
+    last_axes: &mut HashMap<AxisKind, i32>,
+    last_buttons: &mut HashMap<u16, bool>,
+    snapshot: WheelStateSnapshot,
+) -> Result<Vec<sys::input_event>> {
+    let mut events = Vec::with_capacity(snapshot.axes.len() + snapshot.buttons.len() + 1);
+    for axis in snapshot.axes {
+        let axis_profile = profile
+            .axes
+            .iter()
+            .find(|profile| profile.kind == axis.axis)
+            .ok_or_else(|| RemoteSteerError::Backend(format!("unknown axis {:?}", axis.axis)))?;
+        let value = axis.value.clamp(axis_profile.minimum, axis_profile.maximum);
+        if last_axes.get(&axis.axis).copied() != Some(value) {
+            events.push(raw_event(
+                sys::EV_ABS as u16,
+                axis_profile.linux_code,
+                value,
+            ));
+            last_axes.insert(axis.axis, value);
+        }
+    }
+    for button in snapshot.buttons {
+        if !profile
+            .buttons
+            .iter()
+            .any(|profile| profile.linux_code == button.linux_code)
+        {
+            return Err(RemoteSteerError::Backend(format!(
+                "unknown button {}",
+                button.linux_code
+            )));
+        }
+        if last_buttons.get(&button.linux_code).copied() != Some(button.pressed) {
+            events.push(raw_event(
+                sys::EV_KEY as u16,
+                button.linux_code,
+                i32::from(button.pressed),
+            ));
+            last_buttons.insert(button.linux_code, button.pressed);
+        }
+    }
+    if !events.is_empty() {
+        events.push(raw_event(sys::EV_SYN as u16, sys::SYN_REPORT as u16, 0));
+    }
+    Ok(events)
 }
 
 pub fn probe_t150_event() -> Result<Option<LinuxEventProbe>> {
@@ -747,9 +790,13 @@ fn condition_kind_to_sys(condition: ConditionKind) -> u16 {
 #[cfg(test)]
 mod tests {
     use super::{
-        next_namespaced_command_id, COMMAND_NAMESPACE_ERASE, COMMAND_NAMESPACE_INLINE,
-        COMMAND_NAMESPACE_PAYLOAD_MASK, COMMAND_NAMESPACE_UPLOAD,
+        input_events_for_snapshot, next_namespaced_command_id, sys, COMMAND_NAMESPACE_ERASE,
+        COMMAND_NAMESPACE_INLINE, COMMAND_NAMESPACE_PAYLOAD_MASK, COMMAND_NAMESPACE_UPLOAD,
     };
+    use remote_steer_core::{
+        profile_by_id, AxisKind, AxisValue, ButtonValue, WheelProfileId, WheelStateSnapshot,
+    };
+    use std::collections::HashMap;
 
     #[test]
     fn command_ids_are_namespaced_and_monotonic() {
@@ -778,5 +825,107 @@ mod tests {
             COMMAND_NAMESPACE_UPLOAD | COMMAND_NAMESPACE_PAYLOAD_MASK
         );
         assert_eq!(wrapped_payload, COMMAND_NAMESPACE_UPLOAD);
+    }
+
+    #[test]
+    fn input_events_are_clamped_and_deduplicated() {
+        let profile = profile_by_id(WheelProfileId::T150);
+        let mut last_axes = HashMap::new();
+        let mut last_buttons = HashMap::new();
+        let snapshot = WheelStateSnapshot {
+            seq: 1,
+            timestamp_micros: 0,
+            axes: vec![
+                AxisValue {
+                    axis: AxisKind::Wheel,
+                    value: -100,
+                },
+                AxisValue {
+                    axis: AxisKind::HatX,
+                    value: 7,
+                },
+            ],
+            buttons: vec![ButtonValue {
+                linux_code: 0x120,
+                pressed: true,
+            }],
+        };
+
+        let events = input_events_for_snapshot(
+            &profile,
+            &mut last_axes,
+            &mut last_buttons,
+            snapshot.clone(),
+        )
+        .unwrap();
+
+        assert_eq!(events.len(), 4);
+        assert_eq!(
+            (events[0].type_, events[0].code, events[0].value),
+            (sys::EV_ABS as u16, 0x00, 0)
+        );
+        assert_eq!(
+            (events[1].type_, events[1].code, events[1].value),
+            (sys::EV_ABS as u16, 0x10, 1)
+        );
+        assert_eq!(
+            (events[2].type_, events[2].code, events[2].value),
+            (sys::EV_KEY as u16, 0x120, 1)
+        );
+        assert_eq!(
+            (events[3].type_, events[3].code, events[3].value),
+            (sys::EV_SYN as u16, sys::SYN_REPORT as u16, 0)
+        );
+
+        let duplicate =
+            input_events_for_snapshot(&profile, &mut last_axes, &mut last_buttons, snapshot)
+                .unwrap();
+        assert!(duplicate.is_empty());
+    }
+
+    #[test]
+    fn input_events_emit_only_changed_values_after_initial_state() {
+        let profile = profile_by_id(WheelProfileId::T150);
+        let mut last_axes = HashMap::new();
+        let mut last_buttons = HashMap::new();
+        let initial = WheelStateSnapshot {
+            seq: 1,
+            timestamp_micros: 0,
+            axes: vec![AxisValue {
+                axis: AxisKind::Wheel,
+                value: 0,
+            }],
+            buttons: vec![ButtonValue {
+                linux_code: 0x120,
+                pressed: false,
+            }],
+        };
+        input_events_for_snapshot(&profile, &mut last_axes, &mut last_buttons, initial).unwrap();
+
+        let changed = WheelStateSnapshot {
+            seq: 2,
+            timestamp_micros: 0,
+            axes: vec![AxisValue {
+                axis: AxisKind::Wheel,
+                value: 1234,
+            }],
+            buttons: vec![ButtonValue {
+                linux_code: 0x120,
+                pressed: false,
+            }],
+        };
+        let events =
+            input_events_for_snapshot(&profile, &mut last_axes, &mut last_buttons, changed)
+                .unwrap();
+
+        assert_eq!(events.len(), 2);
+        assert_eq!(
+            (events[0].type_, events[0].code, events[0].value),
+            (sys::EV_ABS as u16, 0x00, 1234)
+        );
+        assert_eq!(
+            (events[1].type_, events[1].code, events[1].value),
+            (sys::EV_SYN as u16, sys::SYN_REPORT as u16, 0)
+        );
     }
 }

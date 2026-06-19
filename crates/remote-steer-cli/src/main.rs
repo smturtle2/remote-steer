@@ -8,16 +8,18 @@ use std::process::Command as ProcessCommand;
 #[cfg(unix)]
 use std::process::Stdio;
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::{bail, Context, Result};
 use clap::{Args, Parser, Subcommand, ValueEnum};
 use remote_steer_core::{
     profile_by_id, ConditionAxis, ConditionKind, EffectId, FfbCommand, FfbCommandKind, FfbEffect,
     FfbEffectKind, FfbEnvelope, FfbReplay, FfbReplyKind, PeriodicWaveform, PhysicalWheelBackend,
-    VirtualWheelBackend, WheelProfileId,
+    VirtualWheelBackend, WheelProfileId, WheelStateSnapshot,
 };
-use remote_steer_transport::{profile_hash, Channel, Handshake, TransportMessage, UdpPeer};
+use remote_steer_transport::{
+    profile_hash, Channel, Handshake, InputStaleDrop, TransportMessage, UdpPeer,
+};
 use serde::{Deserialize, Serialize};
 use tokio::net::lookup_host;
 use tokio::time;
@@ -29,6 +31,8 @@ const DEFAULT_BIND: &str = "0.0.0.0:0";
 const CONFIG_ENV: &str = "REMOTE_STEER_CONFIG";
 const SERVER_ENV: &str = "REMOTE_STEER_SERVER";
 const TOKEN_ENV: &str = "REMOTE_STEER_TOKEN";
+const INPUT_RESYNC_INTERVAL: Duration = Duration::from_millis(250);
+const MAX_FFB_COMMANDS_PER_TICK: usize = 16;
 
 #[derive(Debug, Parser)]
 #[command(name = "remote-steer")]
@@ -1021,6 +1025,7 @@ async fn run_physical(
     let mut input_tick = time::interval(Duration::from_millis(4));
     let mut session_ready = false;
     let mut connected_addr = None;
+    let mut input_send_state = InputSendState::new(INPUT_RESYNC_INTERVAL);
 
     loop {
         tokio::select! {
@@ -1057,7 +1062,9 @@ async fn run_physical(
             _ = input_tick.tick() => {
                 if session_ready {
                     if let Some(snapshot) = backend.poll_input()? {
-                        peer.send_to_remote(Channel::Input, &TransportMessage::Input(snapshot)).await?;
+                        if input_send_state.should_send(&snapshot, Instant::now()) {
+                            peer.send_to_remote(Channel::Input, &TransportMessage::Input(snapshot)).await?;
+                        }
                     }
                 }
             }
@@ -1103,13 +1110,18 @@ async fn run_virtual(
     let mut buf = vec![0_u8; 64 * 1024];
     let mut ffb_tick = time::interval(Duration::from_millis(1));
     let mut hello_tick = time::interval(Duration::from_secs(1));
+    let mut input_drop = InputStaleDrop::default();
     loop {
         tokio::select! {
             packet = peer.recv(&mut buf) => {
                 let (addr, channel, message) = packet?;
                 debug!(%addr, ?channel, ?message, "received packet");
                 match message {
-                    TransportMessage::Input(snapshot) => backend.inject_input(snapshot)?,
+                    TransportMessage::Input(snapshot) => {
+                        if input_drop.accept(&snapshot) {
+                            backend.inject_input(snapshot)?;
+                        }
+                    }
                     TransportMessage::HelloAck(_) => {}
                     TransportMessage::FfbReply(reply) => {
                         debug!(
@@ -1123,7 +1135,10 @@ async fn run_virtual(
                 }
             }
             _ = ffb_tick.tick() => {
-                while let Some(command) = backend.poll_ffb()? {
+                for _ in 0..MAX_FFB_COMMANDS_PER_TICK {
+                    let Some(command) = backend.poll_ffb()? else {
+                        break;
+                    };
                     debug!(
                         command_id = command.command_id,
                         kind = ?command.kind,
@@ -1136,6 +1151,43 @@ async fn run_virtual(
                 peer.send_to_remote(Channel::Session, &hello).await?;
             }
         }
+    }
+}
+
+#[derive(Debug)]
+struct InputSendState {
+    last_sent: Option<WheelStateSnapshot>,
+    last_sent_at: Option<Instant>,
+    resync_interval: Duration,
+}
+
+impl InputSendState {
+    fn new(resync_interval: Duration) -> Self {
+        Self {
+            last_sent: None,
+            last_sent_at: None,
+            resync_interval,
+        }
+    }
+
+    fn should_send(&mut self, snapshot: &WheelStateSnapshot, now: Instant) -> bool {
+        let changed = self
+            .last_sent
+            .as_ref()
+            .map(|last| last.axes != snapshot.axes || last.buttons != snapshot.buttons)
+            .unwrap_or(true);
+        let resync_due = self
+            .last_sent_at
+            .map(|last| now.duration_since(last) >= self.resync_interval)
+            .unwrap_or(true);
+
+        if changed || resync_due {
+            self.last_sent = Some(snapshot.clone());
+            self.last_sent_at = Some(now);
+            return true;
+        }
+
+        false
     }
 }
 
@@ -1831,6 +1883,7 @@ fn format_probe(probe: Option<remote_steer_backend_linux::LinuxEventProbe>) -> s
 #[cfg(test)]
 mod tests {
     use super::*;
+    use remote_steer_core::{AxisKind, AxisValue, ButtonValue};
 
     #[test]
     fn saved_server_is_used_when_client_argument_is_missing() {
@@ -1869,5 +1922,52 @@ mod tests {
 
         assert_eq!(resolved.value, "secret");
         assert!(resolved.remember.is_none());
+    }
+
+    #[test]
+    fn input_send_state_sends_first_change_and_resync_only() {
+        let start = Instant::now();
+        let mut state = InputSendState::new(Duration::from_millis(250));
+        let snapshot = WheelStateSnapshot {
+            seq: 1,
+            timestamp_micros: 0,
+            axes: vec![AxisValue {
+                axis: AxisKind::Wheel,
+                value: 10,
+            }],
+            buttons: vec![ButtonValue {
+                linux_code: 0x120,
+                pressed: false,
+            }],
+        };
+
+        assert!(state.should_send(&snapshot, start));
+        assert!(!state.should_send(&snapshot, start + Duration::from_millis(100)));
+        assert!(state.should_send(&snapshot, start + Duration::from_millis(250)));
+    }
+
+    #[test]
+    fn input_send_state_sends_changed_values_before_resync() {
+        let start = Instant::now();
+        let mut state = InputSendState::new(Duration::from_millis(250));
+        let mut snapshot = WheelStateSnapshot {
+            seq: 1,
+            timestamp_micros: 0,
+            axes: vec![AxisValue {
+                axis: AxisKind::Wheel,
+                value: 10,
+            }],
+            buttons: vec![ButtonValue {
+                linux_code: 0x120,
+                pressed: false,
+            }],
+        };
+
+        assert!(state.should_send(&snapshot, start));
+        snapshot.seq = 2;
+        snapshot.timestamp_micros = 10;
+        assert!(!state.should_send(&snapshot, start + Duration::from_millis(10)));
+        snapshot.axes[0].value = 11;
+        assert!(state.should_send(&snapshot, start + Duration::from_millis(20)));
     }
 }
