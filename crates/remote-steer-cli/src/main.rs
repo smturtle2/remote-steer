@@ -1,12 +1,17 @@
 use std::env;
 use std::fs;
+use std::fs::File;
 use std::io::{self, ErrorKind, Write};
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
+use std::process::Command as ProcessCommand;
+#[cfg(unix)]
+use std::process::Stdio;
+use std::thread;
 use std::time::Duration;
 
 use anyhow::{bail, Context, Result};
-use clap::{Parser, Subcommand, ValueEnum};
+use clap::{Args, Parser, Subcommand, ValueEnum};
 use remote_steer_core::{
     profile_by_id, ConditionAxis, ConditionKind, EffectId, FfbCommand, FfbCommandKind, FfbEffect,
     FfbEffectKind, FfbEnvelope, FfbReplay, FfbReplyKind, PeriodicWaveform, PhysicalWheelBackend,
@@ -39,8 +44,8 @@ Quick start:
     remote-steer client <server-ip> --token <shared-token>
 
   After a successful first connection:
-    remote-steer server
-    remote-steer client
+    remote-steer server start
+    remote-steer client start
     remote-steer test
 
 Notes:
@@ -57,33 +62,10 @@ struct Cli {
 enum Command {
     /// Run the machine that has the real wheel attached.
     #[command(visible_alias = "serve")]
-    Server {
-        /// Address to listen on.
-        #[arg(long, default_value = DEFAULT_LISTEN)]
-        listen: SocketAddr,
-        /// Shared token. Can also be set with REMOTE_STEER_TOKEN.
-        #[arg(long, env = TOKEN_ENV, value_name = "TOKEN")]
-        token: Option<String>,
-        /// Wheel profile to expose.
-        #[arg(long, value_enum, default_value_t = ProfileArg::T150)]
-        profile: ProfileArg,
-    },
+    Server(ServerCommand),
     /// Run the machine where the game will see a virtual T150.
     #[command(visible_alias = "connect")]
-    Client {
-        /// Server address. A missing port uses 43150. Can also be set with REMOTE_STEER_SERVER.
-        #[arg(env = SERVER_ENV, value_name = "SERVER")]
-        server: Option<String>,
-        /// Local UDP bind address.
-        #[arg(long, default_value = DEFAULT_BIND)]
-        bind: SocketAddr,
-        /// Shared token. Can also be set with REMOTE_STEER_TOKEN.
-        #[arg(long, env = TOKEN_ENV, value_name = "TOKEN")]
-        token: Option<String>,
-        /// Wheel profile to create.
-        #[arg(long, value_enum, default_value_t = ProfileArg::T150)]
-        profile: ProfileArg,
-    },
+    Client(ClientCommand),
     /// Play the 12 Thrustmaster Test Forces presets.
     Test {
         /// Server address for remote testing. If omitted, uses the saved server first.
@@ -111,7 +93,7 @@ enum Command {
         #[arg(long)]
         listen: SocketAddr,
         #[arg(long, env = TOKEN_ENV)]
-        token: String,
+        token: Option<String>,
         #[arg(long, value_enum, default_value_t = ProfileArg::T150)]
         profile: ProfileArg,
     },
@@ -122,7 +104,7 @@ enum Command {
         #[arg(long, default_value = "0.0.0.0:0")]
         bind: SocketAddr,
         #[arg(long, env = TOKEN_ENV)]
-        token: String,
+        token: Option<String>,
         #[arg(long, value_enum, default_value_t = ProfileArg::T150)]
         profile: ProfileArg,
     },
@@ -141,6 +123,88 @@ enum Command {
         #[arg(long)]
         device: Option<PathBuf>,
     },
+}
+
+#[derive(Debug, Args)]
+struct ServerCommand {
+    #[command(subcommand)]
+    action: Option<ServerAction>,
+    /// Address to listen on.
+    #[arg(long, default_value = DEFAULT_LISTEN)]
+    listen: SocketAddr,
+    /// Shared token. Can also be set with REMOTE_STEER_TOKEN.
+    #[arg(long, env = TOKEN_ENV, value_name = "TOKEN")]
+    token: Option<String>,
+    /// Wheel profile to expose.
+    #[arg(long, value_enum, default_value_t = ProfileArg::T150)]
+    profile: ProfileArg,
+}
+
+#[derive(Debug, Subcommand)]
+enum ServerAction {
+    /// Start the server in the background.
+    Start(ServerStartArgs),
+    /// Stop the background server.
+    Stop,
+    /// Show background server status.
+    Status,
+}
+
+#[derive(Debug, Args)]
+struct ServerStartArgs {
+    /// Address to listen on.
+    #[arg(long, default_value = DEFAULT_LISTEN)]
+    listen: SocketAddr,
+    /// Shared token. Can also be set with REMOTE_STEER_TOKEN.
+    #[arg(long, env = TOKEN_ENV, value_name = "TOKEN")]
+    token: Option<String>,
+    /// Wheel profile to expose.
+    #[arg(long, value_enum, default_value_t = ProfileArg::T150)]
+    profile: ProfileArg,
+}
+
+#[derive(Debug, Args)]
+struct ClientCommand {
+    #[command(subcommand)]
+    action: Option<ClientAction>,
+    /// Server address. A missing port uses 43150. Can also be set with REMOTE_STEER_SERVER.
+    #[arg(env = SERVER_ENV, value_name = "SERVER")]
+    server: Option<String>,
+    /// Local UDP bind address.
+    #[arg(long, default_value = DEFAULT_BIND)]
+    bind: SocketAddr,
+    /// Shared token. Can also be set with REMOTE_STEER_TOKEN.
+    #[arg(long, env = TOKEN_ENV, value_name = "TOKEN")]
+    token: Option<String>,
+    /// Wheel profile to create.
+    #[arg(long, value_enum, default_value_t = ProfileArg::T150)]
+    profile: ProfileArg,
+}
+
+#[derive(Debug, Subcommand)]
+enum ClientAction {
+    /// Start the client in the background.
+    Start(ClientStartArgs),
+    /// Stop the background client.
+    Stop,
+    /// Show background client status.
+    Status,
+}
+
+#[derive(Debug, Args)]
+struct ClientStartArgs {
+    /// Server address. A missing port uses 43150. Can also be set with REMOTE_STEER_SERVER.
+    #[arg(env = SERVER_ENV, value_name = "SERVER")]
+    server: Option<String>,
+    /// Local UDP bind address.
+    #[arg(long, default_value = DEFAULT_BIND)]
+    bind: SocketAddr,
+    /// Shared token. Can also be set with REMOTE_STEER_TOKEN.
+    #[arg(long, env = TOKEN_ENV, value_name = "TOKEN")]
+    token: Option<String>,
+    /// Wheel profile to create.
+    #[arg(long, value_enum, default_value_t = ProfileArg::T150)]
+    profile: ProfileArg,
 }
 
 #[derive(Debug, Clone, Copy, ValueEnum)]
@@ -189,10 +253,30 @@ struct RememberDefaults {
     token: Option<String>,
 }
 
+#[derive(Debug, Clone, Copy)]
+enum ProcessRole {
+    Server,
+    Client,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct ProcessRecord {
+    pid: u32,
+    log_path: PathBuf,
+}
+
 impl From<ProfileArg> for WheelProfileId {
     fn from(value: ProfileArg) -> Self {
         match value {
             ProfileArg::T150 => WheelProfileId::T150,
+        }
+    }
+}
+
+impl ProfileArg {
+    fn as_cli_value(self) -> &'static str {
+        match self {
+            ProfileArg::T150 => "t150",
         }
     }
 }
@@ -208,46 +292,8 @@ async fn main() -> Result<()> {
 
     let cli = Cli::parse();
     match cli.command {
-        Command::Server {
-            listen,
-            token,
-            profile,
-        } => {
-            let saved_config = load_saved_config()?;
-            let token = resolve_token(token, &saved_config, "server")?;
-            run_physical(
-                listen,
-                token.value,
-                profile.into(),
-                RememberDefaults {
-                    token: token.remember,
-                    ..RememberDefaults::default()
-                },
-            )
-            .await
-        }
-        Command::Client {
-            server,
-            bind,
-            token,
-            profile,
-        } => {
-            let saved_config = load_saved_config()?;
-            let server = resolve_server_name(server, &saved_config)?;
-            let token = resolve_token(token, &saved_config, "client")?;
-            let connect = resolve_server(&server.value).await?;
-            run_virtual(
-                bind,
-                connect,
-                token.value,
-                profile.into(),
-                RememberDefaults {
-                    server: server.remember,
-                    token: token.remember,
-                },
-            )
-            .await
-        }
+        Command::Server(command) => run_server_command(command).await,
+        Command::Client(command) => run_client_command(command).await,
         Command::Test {
             server,
             effect,
@@ -263,17 +309,29 @@ async fn main() -> Result<()> {
             listen,
             token,
             profile,
-        } => run_physical(listen, token, profile.into(), RememberDefaults::default()).await,
+        } => {
+            let saved_config = load_saved_config()?;
+            let token = resolve_token(token, &saved_config, "physical")?;
+            run_physical(
+                listen,
+                token.value,
+                profile.into(),
+                RememberDefaults::default(),
+            )
+            .await
+        }
         Command::Virtual {
             connect,
             bind,
             token,
             profile,
         } => {
+            let saved_config = load_saved_config()?;
+            let token = resolve_token(token, &saved_config, "virtual")?;
             run_virtual(
                 bind,
                 connect,
-                token,
+                token.value,
                 profile.into(),
                 RememberDefaults::default(),
             )
@@ -287,6 +345,274 @@ async fn main() -> Result<()> {
             token,
             device,
         } => run_test_ffb(target, effect, connect, bind, token, device).await,
+    }
+}
+
+async fn run_server_command(command: ServerCommand) -> Result<()> {
+    match command.action {
+        Some(ServerAction::Start(args)) => start_server(args).await,
+        Some(ServerAction::Stop) => stop_managed(ProcessRole::Server),
+        Some(ServerAction::Status) => status_managed(ProcessRole::Server),
+        None => {
+            let saved_config = load_saved_config()?;
+            let token = resolve_token(command.token, &saved_config, "server")?;
+            run_physical(
+                command.listen,
+                token.value,
+                command.profile.into(),
+                RememberDefaults {
+                    token: token.remember,
+                    ..RememberDefaults::default()
+                },
+            )
+            .await
+        }
+    }
+}
+
+async fn run_client_command(command: ClientCommand) -> Result<()> {
+    match command.action {
+        Some(ClientAction::Start(args)) => start_client(args).await,
+        Some(ClientAction::Stop) => stop_managed(ProcessRole::Client),
+        Some(ClientAction::Status) => status_managed(ProcessRole::Client),
+        None => {
+            let saved_config = load_saved_config()?;
+            let server = resolve_server_name(command.server, &saved_config)?;
+            let token = resolve_token(command.token, &saved_config, "client")?;
+            let connect = resolve_server(&server.value).await?;
+            run_virtual(
+                command.bind,
+                connect,
+                token.value,
+                command.profile.into(),
+                RememberDefaults {
+                    server: server.remember,
+                    token: token.remember,
+                },
+            )
+            .await
+        }
+    }
+}
+
+async fn start_server(args: ServerStartArgs) -> Result<()> {
+    let saved_config = load_saved_config()?;
+    let token = resolve_token(args.token, &saved_config, "server start")?;
+    let remember = RememberDefaults {
+        token: token.remember,
+        ..RememberDefaults::default()
+    };
+    if let Some(path) = remember_defaults(remember)? {
+        println!("saved defaults: {}", path.display());
+    }
+
+    start_managed(
+        ProcessRole::Server,
+        vec![
+            "physical".to_string(),
+            "--listen".to_string(),
+            args.listen.to_string(),
+            "--profile".to_string(),
+            args.profile.as_cli_value().to_string(),
+        ],
+    )
+}
+
+async fn start_client(args: ClientStartArgs) -> Result<()> {
+    let saved_config = load_saved_config()?;
+    let server = resolve_server_name(args.server, &saved_config)?;
+    let token = resolve_token(args.token, &saved_config, "client start")?;
+    let connect = resolve_server(&server.value).await?;
+    let remember = RememberDefaults {
+        server: server.remember,
+        token: token.remember,
+    };
+    if let Some(path) = remember_defaults(remember)? {
+        println!("saved defaults: {}", path.display());
+    }
+
+    start_managed(
+        ProcessRole::Client,
+        vec![
+            "virtual".to_string(),
+            "--connect".to_string(),
+            connect.to_string(),
+            "--bind".to_string(),
+            args.bind.to_string(),
+            "--profile".to_string(),
+            args.profile.as_cli_value().to_string(),
+        ],
+    )
+}
+
+fn start_managed(role: ProcessRole, args: Vec<String>) -> Result<()> {
+    match read_process_record(role)? {
+        Some(record) if process_is_running(record.pid) => {
+            bail!(
+                "{} is already running with pid {}; log: {}",
+                role.label(),
+                record.pid,
+                record.log_path.display()
+            )
+        }
+        Some(_) => {
+            let _ = fs::remove_file(process_record_path(role)?);
+        }
+        None => {}
+    }
+
+    let log_path = process_log_path(role)?;
+    if let Some(parent) = log_path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    File::create(&log_path)
+        .with_context(|| format!("failed to create log {}", log_path.display()))?;
+
+    let pid = spawn_managed_child(&args, &log_path)
+        .with_context(|| format!("failed to start {}", role.label()))?;
+    thread::sleep(Duration::from_millis(500));
+    if !process_is_running(pid) {
+        bail!(
+            "{} exited immediately; log: {}",
+            role.label(),
+            log_path.display()
+        );
+    }
+    let record = ProcessRecord { pid, log_path };
+    write_process_record(role, &record)?;
+    println!("started {}: pid {}", role.label(), record.pid);
+    println!("log: {}", record.log_path.display());
+    println!("stop: remote-steer {} stop", role.command_name());
+    Ok(())
+}
+
+#[cfg(unix)]
+fn spawn_managed_child(args: &[String], log_path: &Path) -> Result<u32> {
+    let stdout = File::create(log_path)
+        .with_context(|| format!("failed to create log {}", log_path.display()))?;
+    let stderr = stdout
+        .try_clone()
+        .with_context(|| format!("failed to clone log {}", log_path.display()))?;
+    let exe = env::current_exe().context("failed to resolve current executable")?;
+    let mut command = ProcessCommand::new(exe);
+    command
+        .args(args)
+        .stdin(Stdio::null())
+        .stdout(Stdio::from(stdout))
+        .stderr(Stdio::from(stderr));
+    configure_detached_child(&mut command);
+    let child = command.spawn()?;
+    Ok(child.id())
+}
+
+#[cfg(windows)]
+fn spawn_managed_child(args: &[String], log_path: &Path) -> Result<u32> {
+    let exe = env::current_exe().context("failed to resolve current executable")?;
+    let mut command_line = format!("cmd.exe /C \"\"{}\"", exe.display());
+    for arg in args {
+        command_line.push(' ');
+        command_line.push_str(&quote_windows_cmd_arg(arg));
+    }
+    command_line.push_str(&format!(" > \"{}\" 2>&1\"", log_path.display()));
+
+    let output = ProcessCommand::new("wmic")
+        .args(["process", "call", "create", &command_line])
+        .output()
+        .context("failed to run wmic")?;
+    if !output.status.success() {
+        bail!(
+            "wmic failed: {}{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+    parse_wmic_process_id(&String::from_utf8_lossy(&output.stdout))
+        .ok_or_else(|| anyhow::anyhow!("wmic did not return a process id"))
+}
+
+#[cfg(not(any(unix, windows)))]
+fn spawn_managed_child(_args: &[String], _log_path: &Path) -> Result<u32> {
+    bail!("background start is not implemented on this OS")
+}
+
+#[cfg(windows)]
+fn quote_windows_cmd_arg(arg: &str) -> String {
+    if arg.bytes().all(|byte| {
+        byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b':' | b'_' | b'-' | b'/' | b'\\')
+    }) {
+        return arg.to_string();
+    }
+    format!("\"{}\"", arg.replace('"', "\\\""))
+}
+
+#[cfg(windows)]
+fn parse_wmic_process_id(output: &str) -> Option<u32> {
+    let marker = "ProcessId =";
+    let start = output.find(marker)? + marker.len();
+    let rest = &output[start..];
+    let value = rest
+        .chars()
+        .skip_while(|ch| ch.is_whitespace())
+        .take_while(|ch| ch.is_ascii_digit())
+        .collect::<String>();
+    value.parse().ok()
+}
+
+fn stop_managed(role: ProcessRole) -> Result<()> {
+    let Some(record) = read_process_record(role)? else {
+        println!("{} stopped", role.label());
+        return Ok(());
+    };
+
+    if !process_is_running(record.pid) {
+        let _ = fs::remove_file(process_record_path(role)?);
+        println!("{} stale pid removed: {}", role.label(), record.pid);
+        return Ok(());
+    }
+
+    terminate_process(record.pid)?;
+    for _ in 0..20 {
+        if !process_is_running(record.pid) {
+            let _ = fs::remove_file(process_record_path(role)?);
+            println!("stopped {}: pid {}", role.label(), record.pid);
+            return Ok(());
+        }
+        thread::sleep(Duration::from_millis(100));
+    }
+    force_terminate_process(record.pid)?;
+    let _ = fs::remove_file(process_record_path(role)?);
+    println!("stopped {}: pid {}", role.label(), record.pid);
+    Ok(())
+}
+
+fn status_managed(role: ProcessRole) -> Result<()> {
+    let Some(record) = read_process_record(role)? else {
+        println!("{} stopped", role.label());
+        return Ok(());
+    };
+
+    if process_is_running(record.pid) {
+        println!("{} running: pid {}", role.label(), record.pid);
+    } else {
+        println!("{} stale: pid {}", role.label(), record.pid);
+    }
+    println!("log: {}", record.log_path.display());
+    Ok(())
+}
+
+impl ProcessRole {
+    fn command_name(self) -> &'static str {
+        match self {
+            ProcessRole::Server => "server",
+            ProcessRole::Client => "client",
+        }
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            ProcessRole::Server => "server",
+            ProcessRole::Client => "client",
+        }
     }
 }
 
@@ -462,6 +788,149 @@ fn config_path() -> Result<PathBuf> {
         .join(".config")
         .join("remote-steer")
         .join("config.json"))
+}
+
+fn state_dir() -> Result<PathBuf> {
+    let path = config_path()?;
+    if let Some(parent) = path.parent() {
+        if !parent.as_os_str().is_empty() {
+            return Ok(parent.to_path_buf());
+        }
+    }
+    env::current_dir().context("failed to resolve current directory")
+}
+
+fn process_record_path(role: ProcessRole) -> Result<PathBuf> {
+    Ok(state_dir()?.join(format!("remote-steer-{}.pid.json", role.command_name())))
+}
+
+fn process_log_path(role: ProcessRole) -> Result<PathBuf> {
+    Ok(state_dir()?.join(format!("remote-steer-{}.log", role.command_name())))
+}
+
+fn read_process_record(role: ProcessRole) -> Result<Option<ProcessRecord>> {
+    let path = process_record_path(role)?;
+    let contents = match fs::read_to_string(&path) {
+        Ok(contents) => contents,
+        Err(err) if err.kind() == ErrorKind::NotFound => return Ok(None),
+        Err(err) => {
+            return Err(err)
+                .with_context(|| format!("failed to read process state {}", path.display()))
+        }
+    };
+    serde_json::from_str(&contents)
+        .map(Some)
+        .with_context(|| format!("failed to parse process state {}", path.display()))
+}
+
+fn write_process_record(role: ProcessRole, record: &ProcessRecord) -> Result<()> {
+    let path = process_record_path(role)?;
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent).with_context(|| {
+            format!(
+                "failed to create remote-steer state directory {}",
+                parent.display()
+            )
+        })?;
+    }
+    let contents = format!("{}\n", serde_json::to_string_pretty(record)?);
+    write_private_file(&path, contents.as_bytes())
+        .with_context(|| format!("failed to write process state {}", path.display()))
+}
+
+#[cfg(unix)]
+fn configure_detached_child(command: &mut ProcessCommand) {
+    use std::os::unix::process::CommandExt;
+
+    unsafe {
+        command.pre_exec(|| {
+            if libc::setsid() == -1 {
+                return Err(io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
+}
+
+#[cfg(unix)]
+fn process_is_running(pid: u32) -> bool {
+    let rc = unsafe { libc::kill(pid as libc::pid_t, 0) };
+    if rc == 0 {
+        return true;
+    }
+    io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
+}
+
+#[cfg(windows)]
+fn process_is_running(pid: u32) -> bool {
+    let output = ProcessCommand::new("tasklist")
+        .args(["/FI", &format!("PID eq {pid}"), "/FO", "CSV", "/NH"])
+        .output();
+    let Ok(output) = output else {
+        return false;
+    };
+    if !output.status.success() {
+        return false;
+    }
+    String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .filter(|line| line.trim_start().starts_with('"'))
+        .any(|line| {
+            line.split(',')
+                .nth(1)
+                .map(|field| field.trim_matches('"') == pid.to_string())
+                .unwrap_or(false)
+        })
+}
+
+#[cfg(not(any(unix, windows)))]
+fn process_is_running(_pid: u32) -> bool {
+    false
+}
+
+#[cfg(unix)]
+fn terminate_process(pid: u32) -> Result<()> {
+    let rc = unsafe { libc::kill(pid as libc::pid_t, libc::SIGTERM) };
+    if rc == -1 {
+        return Err(io::Error::last_os_error()).context("failed to terminate process");
+    }
+    Ok(())
+}
+
+#[cfg(windows)]
+fn terminate_process(pid: u32) -> Result<()> {
+    force_terminate_process(pid)
+}
+
+#[cfg(not(any(unix, windows)))]
+fn terminate_process(_pid: u32) -> Result<()> {
+    bail!("process stop is not implemented on this OS")
+}
+
+#[cfg(unix)]
+fn force_terminate_process(pid: u32) -> Result<()> {
+    let rc = unsafe { libc::kill(pid as libc::pid_t, libc::SIGKILL) };
+    if rc == -1 {
+        return Err(io::Error::last_os_error()).context("failed to force terminate process");
+    }
+    Ok(())
+}
+
+#[cfg(windows)]
+fn force_terminate_process(pid: u32) -> Result<()> {
+    let status = ProcessCommand::new("taskkill")
+        .args(["/PID", &pid.to_string(), "/T", "/F"])
+        .status()
+        .context("failed to run taskkill")?;
+    if !status.success() {
+        bail!("taskkill failed with {status}");
+    }
+    Ok(())
+}
+
+#[cfg(not(any(unix, windows)))]
+fn force_terminate_process(_pid: u32) -> Result<()> {
+    bail!("process stop is not implemented on this OS")
 }
 
 async fn run_easy_test(

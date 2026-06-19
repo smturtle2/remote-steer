@@ -49,14 +49,18 @@ token. Daily use becomes:
 
 ```sh
 # Windows wheel machine
-remote-steer server
+remote-steer server start
 
 # Linux game machine
-remote-steer client
+remote-steer client start
 ```
 
 The Linux side creates a virtual Thrustmaster T150 input device. Start the game
 after the client is connected and select the virtual wheel.
+
+Use `remote-steer server status`, `remote-steer server stop`,
+`remote-steer client status`, and `remote-steer client stop` to manage the
+background processes.
 
 ## Force-Feedback Test
 
@@ -94,8 +98,8 @@ Download the latest release from
 
 For this release, use:
 
-- `remote-steer-v0.0.1-windows-x86_64.zip` on the Windows wheel machine
-- `remote-steer-v0.0.1-linux-x86_64.tar.gz` on the Linux game machine
+- `remote-steer-v0.0.2-windows-x86_64.zip` on the Windows wheel machine
+- `remote-steer-v0.0.2-linux-x86_64.tar.gz` on the Linux game machine
 - `SHA256SUMS` to verify downloaded files
 
 Build from source:
@@ -110,8 +114,14 @@ cargo build --release --target x86_64-pc-windows-gnu -p remote-steer
 ```sh
 remote-steer server --token <shared-token>
 remote-steer server
+remote-steer server start
+remote-steer server status
+remote-steer server stop
 remote-steer client <server-host-or-ip> --token <shared-token>
 remote-steer client
+remote-steer client start
+remote-steer client status
+remote-steer client stop
 remote-steer test
 remote-steer test --effect engine
 remote-steer probe physical

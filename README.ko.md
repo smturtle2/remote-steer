@@ -49,14 +49,17 @@ remote-steer client <windows-host-or-ip> --token <shared-token>
 
 ```sh
 # Windows 휠 PC
-remote-steer server
+remote-steer server start
 
 # Linux 게임 PC
-remote-steer client
+remote-steer client start
 ```
 
 Linux 쪽에는 가상 Thrustmaster T150 입력 장치가 생성됩니다. 클라이언트 연결 후
 게임을 시작하고 가상 휠을 선택하면 됩니다.
+
+백그라운드 프로세스는 `remote-steer server status`, `remote-steer server stop`,
+`remote-steer client status`, `remote-steer client stop`으로 관리합니다.
 
 ## Force Feedback 테스트
 
@@ -94,8 +97,8 @@ Spring과 damper는 condition effect라서 휠이 스스로 튀는 효과가 아
 
 이번 릴리즈에서는 다음 파일을 사용합니다:
 
-- Windows 휠 PC: `remote-steer-v0.0.1-windows-x86_64.zip`
-- Linux 게임 PC: `remote-steer-v0.0.1-linux-x86_64.tar.gz`
+- Windows 휠 PC: `remote-steer-v0.0.2-windows-x86_64.zip`
+- Linux 게임 PC: `remote-steer-v0.0.2-linux-x86_64.tar.gz`
 - 다운로드 검증: `SHA256SUMS`
 
 소스에서 빌드:
@@ -110,8 +113,14 @@ cargo build --release --target x86_64-pc-windows-gnu -p remote-steer
 ```sh
 remote-steer server --token <shared-token>
 remote-steer server
+remote-steer server start
+remote-steer server status
+remote-steer server stop
 remote-steer client <server-host-or-ip> --token <shared-token>
 remote-steer client
+remote-steer client start
+remote-steer client status
+remote-steer client stop
 remote-steer test
 remote-steer test --effect engine
 remote-steer probe physical
