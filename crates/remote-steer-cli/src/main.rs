@@ -90,6 +90,17 @@ enum Command {
         #[arg(value_enum)]
         target: ProbeTarget,
     },
+    /// Stream raw input values from the current backend.
+    Monitor {
+        #[arg(value_enum)]
+        target: ProbeTarget,
+        /// Number of samples to print. Use 0 to run until interrupted.
+        #[arg(long, default_value_t = 200)]
+        samples: usize,
+        /// Delay between samples.
+        #[arg(long, default_value_t = 50)]
+        interval_ms: u64,
+    },
     /// Dump Windows DirectInput details for the T150.
     DumpDirectInput,
     #[command(hide = true)]
@@ -308,6 +319,11 @@ async fn main() -> Result<()> {
             run_easy_test(effect, server, bind, token, saved_config).await
         }
         Command::Probe { target } => run_probe(target),
+        Command::Monitor {
+            target,
+            samples,
+            interval_ms,
+        } => run_monitor(target, samples, interval_ms),
         Command::DumpDirectInput => run_dump_direct_input(),
         Command::Physical {
             listen,
@@ -1200,6 +1216,28 @@ fn run_probe(target: ProbeTarget) -> Result<()> {
             Ok(())
         }
     }
+}
+
+fn run_monitor(target: ProbeTarget, samples: usize, interval_ms: u64) -> Result<()> {
+    match target {
+        ProbeTarget::Physical => monitor_physical(samples, interval_ms),
+        ProbeTarget::Virtual => bail!("virtual monitor is not implemented; use `jstest --normal /dev/input/jsX` for the Linux virtual device"),
+    }
+}
+
+#[cfg(windows)]
+fn monitor_physical(samples: usize, interval_ms: u64) -> Result<()> {
+    let samples = if samples == 0 { None } else { Some(samples) };
+    remote_steer_backend_windows::monitor_t150_directinput(
+        samples,
+        Duration::from_millis(interval_ms),
+    )?;
+    Ok(())
+}
+
+#[cfg(not(windows))]
+fn monitor_physical(_samples: usize, _interval_ms: u64) -> Result<()> {
+    bail!("physical monitor is only available on Windows")
 }
 
 #[cfg(windows)]

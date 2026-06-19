@@ -1,9 +1,10 @@
 use std::collections::HashMap;
 use std::ffi::c_void;
-use std::fmt::Write;
+use std::fmt::{self, Write};
 use std::mem::{offset_of, size_of};
 use std::ptr::null_mut;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::thread::sleep;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use remote_steer_core::{
     profile_by_id, AxisKind, AxisValue, BackendCapabilities, ButtonValue, EffectId, FfbCommand,
@@ -17,13 +18,14 @@ use windows::Win32::Devices::HumanInterfaceDevice::{
     GUID_Sine, GUID_Slider, GUID_Spring, GUID_Square, GUID_Triangle, GUID_XAxis, GUID_YAxis,
     GUID_ZAxis, IDirectInput8W, IDirectInputDevice8W, IDirectInputEffect, DI8DEVCLASS_GAMECTRL,
     DICONDITION, DICONSTANTFORCE, DIDATAFORMAT, DIDEVCAPS, DIDEVICEINSTANCEW,
-    DIDEVICEOBJECTINSTANCEW, DIDFT_ALL, DIDFT_AXIS, DIDFT_FFACTUATOR, DIDF_ABSAXIS,
-    DIDOI_FFACTUATOR, DIEB_NOTRIGGER, DIEDFL_ATTACHEDONLY, DIEDFL_FORCEFEEDBACK, DIEFFECT,
-    DIEFFECTINFOW, DIEFF_CARTESIAN, DIEFF_OBJECTIDS, DIEFF_OBJECTOFFSETS, DIEFF_POLAR, DIEFT_ALL,
-    DIENUM_CONTINUE, DIENUM_STOP, DIENVELOPE, DIERR_INPUTLOST, DIERR_NOTACQUIRED, DIJOYSTATE2,
-    DIOBJECTDATAFORMAT, DIPERIODIC, DIPH_BYOFFSET, DIPH_DEVICE, DIPROPDWORD, DIPROPHEADER,
-    DIPROPRANGE, DIPROP_AUTOCENTER, DIPROP_FFGAIN, DIPROP_RANGE, DIRAMPFORCE, DIRECTINPUT_VERSION,
-    DISCL_BACKGROUND, DISCL_EXCLUSIVE, DISFFC_RESET, DISFFC_STOPALL, DI_FFNOMINALMAX, GUID_POV,
+    DIDEVICEOBJECTINSTANCEW, DIDFT_ALL, DIDFT_AXIS, DIDFT_FFACTUATOR, DIDFT_INSTANCEMASK,
+    DIDF_ABSAXIS, DIDOI_FFACTUATOR, DIEB_NOTRIGGER, DIEDFL_ATTACHEDONLY, DIEDFL_FORCEFEEDBACK,
+    DIEFFECT, DIEFFECTINFOW, DIEFF_CARTESIAN, DIEFF_OBJECTIDS, DIEFF_OBJECTOFFSETS, DIEFF_POLAR,
+    DIEFT_ALL, DIENUM_CONTINUE, DIENUM_STOP, DIENVELOPE, DIERR_INPUTLOST, DIERR_NOTACQUIRED,
+    DIJOYSTATE2, DIOBJECTDATAFORMAT, DIPERIODIC, DIPH_BYID, DIPH_BYOFFSET, DIPH_DEVICE,
+    DIPROPDWORD, DIPROPHEADER, DIPROPRANGE, DIPROP_AUTOCENTER, DIPROP_FFGAIN, DIPROP_RANGE,
+    DIRAMPFORCE, DIRECTINPUT_VERSION, DISCL_BACKGROUND, DISCL_EXCLUSIVE, DISFFC_RESET,
+    DISFFC_STOPALL, DI_FFNOMINALMAX, GUID_POV,
 };
 use windows::Win32::Foundation::{HINSTANCE, HWND, LPARAM, LRESULT, WPARAM};
 use windows::Win32::System::Com::{CoInitializeEx, CoUninitialize, COINIT_MULTITHREADED};
@@ -35,9 +37,6 @@ use windows::Win32::UI::WindowsAndMessaging::{
 
 const T150_VENDOR: u16 = 0x044f;
 const T150_PRODUCT: u16 = 0xb677;
-const DIDFT_AXIS_ANY_OPTIONAL: u32 = 0x80ff_ff03;
-const DIDFT_BUTTON_ANY_OPTIONAL: u32 = 0x80ff_ff0c;
-const DIDFT_POV_ANY_OPTIONAL: u32 = 0x80ff_ff10;
 const DATA_FORMAT_ASPECT_POSITION: u32 = 0x0001_0000;
 
 pub struct WindowsPhysicalBackend {
@@ -391,22 +390,31 @@ pub fn dump_t150_directinput() -> Result<String> {
             .ok();
         }
 
-        let mut data_objects = joystick2_object_format();
-        let mut data_format = DIDATAFORMAT {
-            dwSize: size_of::<DIDATAFORMAT>() as u32,
-            dwObjSize: size_of::<DIOBJECTDATAFORMAT>() as u32,
-            dwFlags: DIDF_ABSAXIS,
-            dwDataSize: size_of::<DIJOYSTATE2>() as u32,
-            dwNumObjs: data_objects.len() as u32,
-            rgodf: data_objects.as_mut_ptr(),
-        };
-        let set_data_format = device.SetDataFormat(&mut data_format);
-        writeln!(
-            &mut output,
-            "set_data_format: {:?}",
-            set_data_format.map_err(|err| err.to_string())
-        )
-        .ok();
+        match t150_data_format(&device) {
+            Ok(mut selection) => {
+                let mut data_format = DIDATAFORMAT {
+                    dwSize: size_of::<DIDATAFORMAT>() as u32,
+                    dwObjSize: size_of::<DIOBJECTDATAFORMAT>() as u32,
+                    dwFlags: DIDF_ABSAXIS,
+                    dwDataSize: size_of::<DIJOYSTATE2>() as u32,
+                    dwNumObjs: selection.objects.len() as u32,
+                    rgodf: selection.objects.as_mut_ptr(),
+                };
+                let set_data_format = device.SetDataFormat(&mut data_format);
+                writeln!(
+                    &mut output,
+                    "set_data_format: {:?}",
+                    set_data_format.map_err(|err| err.to_string())
+                )
+                .ok();
+                for diagnostic in configure_axis_ranges(&device, &selection.range_requests) {
+                    writeln!(&mut output, "{diagnostic}").ok();
+                }
+            }
+            Err(err) => {
+                writeln!(&mut output, "set_data_format: ERROR {err}").ok();
+            }
+        }
         let set_coop =
             device.SetCooperativeLevel(window.hwnd(), DISCL_BACKGROUND | DISCL_EXCLUSIVE);
         writeln!(
@@ -471,6 +479,70 @@ pub fn dump_t150_directinput() -> Result<String> {
     Ok(output)
 }
 
+pub fn monitor_t150_directinput(samples: Option<usize>, interval: Duration) -> Result<()> {
+    let _com = ComApartment::initialize()?;
+    let window = HiddenWindow::create()?;
+    let input = create_direct_input()?;
+    let candidate = find_t150_candidate(&input)?;
+    let device = create_device(&input, &candidate)?;
+    let (_ffb_axis_object_id, range_diagnostics) =
+        configure_device_with_range_diagnostics(&device, window.hwnd())?;
+
+    println!(
+        "device: {} ({:04x}:{:04x})",
+        candidate.display_name(),
+        candidate.vendor,
+        candidate.product
+    );
+    for diagnostic in range_diagnostics {
+        println!("{}", diagnostic.format());
+    }
+    if samples == Some(0) {
+        return Ok(());
+    }
+
+    unsafe {
+        let mut sample = 0_u64;
+        loop {
+            if let Err(err) = device.Poll() {
+                if is_reacquire_error(&err) {
+                    device
+                        .Acquire()
+                        .map_err(|err| windows_error("DirectInput Acquire", err))?;
+                } else {
+                    return Err(windows_error("DirectInput Poll", err));
+                }
+            }
+
+            let mut state = DIJOYSTATE2::default();
+            if let Err(err) = device.GetDeviceState(
+                size_of::<DIJOYSTATE2>() as u32,
+                &mut state as *mut DIJOYSTATE2 as *mut c_void,
+            ) {
+                if is_reacquire_error(&err) {
+                    device
+                        .Acquire()
+                        .map_err(|err| windows_error("DirectInput Acquire", err))?;
+                } else {
+                    return Err(windows_error("DirectInput GetDeviceState", err));
+                }
+            } else {
+                println!("{}", format_monitor_line(sample, &state));
+            }
+
+            sample = sample.wrapping_add(1);
+            if samples.is_some_and(|limit| sample as usize >= limit) {
+                break;
+            }
+            if !interval.is_zero() {
+                sleep(interval);
+            }
+        }
+    }
+
+    Ok(())
+}
+
 #[derive(Default)]
 struct ObjectDumpContext {
     records: Vec<ObjectRecord>,
@@ -499,6 +571,23 @@ struct EffectRecord {
     static_params: u32,
     dynamic_params: u32,
     name: String,
+}
+
+fn enumerate_object_records(
+    device: &IDirectInputDevice8W,
+    flags: u32,
+) -> Result<Vec<ObjectRecord>> {
+    let mut context = ObjectDumpContext::default();
+    unsafe {
+        device
+            .EnumObjects(
+                Some(enum_object_dump_callback),
+                &mut context as *mut ObjectDumpContext as *mut c_void,
+                flags,
+            )
+            .map_err(|err| windows_error("DirectInput EnumObjects", err))?;
+    }
+    Ok(context.records)
 }
 
 unsafe extern "system" fn enum_object_dump_callback(
@@ -830,14 +919,29 @@ fn create_device(
 }
 
 fn configure_device(device: &IDirectInputDevice8W, hwnd: HWND) -> Result<u32> {
-    let mut objects = joystick2_object_format();
+    let (ffb_axis_object_id, range_diagnostics) =
+        configure_device_with_range_diagnostics(device, hwnd)?;
+    for diagnostic in range_diagnostics
+        .iter()
+        .filter(|diagnostic| !diagnostic.success)
+    {
+        eprintln!("{}", diagnostic.format());
+    }
+    Ok(ffb_axis_object_id)
+}
+
+fn configure_device_with_range_diagnostics(
+    device: &IDirectInputDevice8W,
+    hwnd: HWND,
+) -> Result<(u32, Vec<AxisRangeDiagnostic>)> {
+    let mut selection = t150_data_format(device)?;
     let mut data_format = DIDATAFORMAT {
         dwSize: size_of::<DIDATAFORMAT>() as u32,
         dwObjSize: size_of::<DIOBJECTDATAFORMAT>() as u32,
         dwFlags: DIDF_ABSAXIS,
         dwDataSize: size_of::<DIJOYSTATE2>() as u32,
-        dwNumObjs: objects.len() as u32,
-        rgodf: objects.as_mut_ptr(),
+        dwNumObjs: selection.objects.len() as u32,
+        rgodf: selection.objects.as_mut_ptr(),
     };
 
     unsafe {
@@ -846,15 +950,7 @@ fn configure_device(device: &IDirectInputDevice8W, hwnd: HWND) -> Result<u32> {
             .map_err(|err| windows_error("DirectInput SetDataFormat DIJOYSTATE2", err))?;
         let ffb_axis_object_id = find_ffb_axis_object_id(device)?;
 
-        try_set_axis_range(device, offset_u32(offset_of!(DIJOYSTATE2, lX)), 0, 65535);
-        try_set_axis_range(device, offset_u32(offset_of!(DIJOYSTATE2, lY)), 0, 255);
-        try_set_axis_range(device, offset_u32(offset_of!(DIJOYSTATE2, lRz)), 0, 255);
-        try_set_axis_range(
-            device,
-            offset_u32(offset_of!(DIJOYSTATE2, rglSlider)),
-            0,
-            255,
-        );
+        let range_diagnostics = configure_axis_ranges(device, &selection.range_requests);
 
         device
             .SetCooperativeLevel(hwnd, DISCL_BACKGROUND | DISCL_EXCLUSIVE)
@@ -871,61 +967,127 @@ fn configure_device(device: &IDirectInputDevice8W, hwnd: HWND) -> Result<u32> {
             .SendForceFeedbackCommand(DISFFC_RESET)
             .map_err(|err| windows_error("DirectInput SendForceFeedbackCommand RESET", err))?;
 
-        Ok(ffb_axis_object_id)
+        Ok((ffb_axis_object_id, range_diagnostics))
     }
 }
 
-fn joystick2_object_format() -> Vec<DIOBJECTDATAFORMAT> {
-    let mut objects = Vec::with_capacity(136);
-    objects.push(object_format(
-        &GUID_XAxis,
-        offset_u32(offset_of!(DIJOYSTATE2, lX)),
-        DIDFT_AXIS_ANY_OPTIONAL,
-        DATA_FORMAT_ASPECT_POSITION,
-    ));
-    objects.push(object_format(
-        &GUID_YAxis,
-        offset_u32(offset_of!(DIJOYSTATE2, lY)),
-        DIDFT_AXIS_ANY_OPTIONAL,
-        DATA_FORMAT_ASPECT_POSITION,
-    ));
-    objects.push(object_format(
-        &GUID_RzAxis,
-        offset_u32(offset_of!(DIJOYSTATE2, lRz)),
-        DIDFT_AXIS_ANY_OPTIONAL,
-        DATA_FORMAT_ASPECT_POSITION,
-    ));
-    objects.push(object_format(
-        &GUID_Slider,
-        offset_u32(offset_of!(DIJOYSTATE2, rglSlider)),
-        DIDFT_AXIS_ANY_OPTIONAL,
-        DATA_FORMAT_ASPECT_POSITION,
-    ));
+struct T150DataFormat {
+    objects: Vec<DIOBJECTDATAFORMAT>,
+    range_requests: Vec<AxisRangeRequest>,
+}
 
-    for index in 0..4 {
-        objects.push(object_format(
-            &GUID_POV,
-            offset_u32(offset_of!(DIJOYSTATE2, rgdwPOV) + index * size_of::<u32>()),
-            DIDFT_POV_ANY_OPTIONAL,
+#[derive(Debug, Clone, Copy)]
+struct AxisFormatSpec {
+    label: &'static str,
+    guid_label: &'static str,
+    offset: u32,
+    minimum: i32,
+    maximum: i32,
+}
+
+fn t150_axis_specs() -> [AxisFormatSpec; 4] {
+    [
+        AxisFormatSpec {
+            label: "lX",
+            guid_label: "GUID_XAxis",
+            offset: offset_u32(offset_of!(DIJOYSTATE2, lX)),
+            minimum: 0,
+            maximum: 65535,
+        },
+        AxisFormatSpec {
+            label: "lY",
+            guid_label: "GUID_YAxis",
+            offset: offset_u32(offset_of!(DIJOYSTATE2, lY)),
+            minimum: 0,
+            maximum: 255,
+        },
+        AxisFormatSpec {
+            label: "lRz",
+            guid_label: "GUID_RzAxis",
+            offset: offset_u32(offset_of!(DIJOYSTATE2, lRz)),
+            minimum: 0,
+            maximum: 255,
+        },
+        AxisFormatSpec {
+            label: "slider0",
+            guid_label: "GUID_Slider",
+            offset: offset_u32(offset_of!(DIJOYSTATE2, rglSlider)),
+            minimum: 0,
+            maximum: 255,
+        },
+    ]
+}
+
+fn t150_data_format(device: &IDirectInputDevice8W) -> Result<T150DataFormat> {
+    let records = enumerate_object_records(device, DIDFT_ALL)?;
+    t150_data_format_from_records(&records)
+}
+
+fn t150_data_format_from_records(records: &[ObjectRecord]) -> Result<T150DataFormat> {
+    let mut objects = Vec::with_capacity(18);
+    let mut range_requests = Vec::with_capacity(4);
+    for spec in t150_axis_specs() {
+        let record = find_object_record(records, spec.guid_label)?;
+        objects.push(exact_object_format(
+            spec.offset,
+            data_format_type(record.object_type),
+            DATA_FORMAT_ASPECT_POSITION,
+        ));
+        range_requests.push(AxisRangeRequest {
+            axis: spec.label,
+            offset: spec.offset,
+            object_id: record.object_type,
+            minimum: spec.minimum,
+            maximum: spec.maximum,
+        });
+    }
+
+    if let Some(record) = records.iter().find(|record| record.guid == "GUID_POV") {
+        objects.push(exact_object_format(
+            offset_u32(offset_of!(DIJOYSTATE2, rgdwPOV)),
+            data_format_type(record.object_type),
             0,
         ));
     }
 
-    for index in 0..128 {
-        objects.push(object_format(
-            &GUID_Button,
+    for (index, record) in records
+        .iter()
+        .filter(|record| record.guid == "GUID_Button")
+        .take(128)
+        .enumerate()
+    {
+        objects.push(exact_object_format(
             offset_u32(offset_of!(DIJOYSTATE2, rgbButtons) + index),
-            DIDFT_BUTTON_ANY_OPTIONAL,
+            data_format_type(record.object_type),
             0,
         ));
     }
 
-    objects
+    Ok(T150DataFormat {
+        objects,
+        range_requests,
+    })
 }
 
-fn object_format(guid: &GUID, offset: u32, data_type: u32, flags: u32) -> DIOBJECTDATAFORMAT {
+fn data_format_type(object_type: u32) -> u32 {
+    (object_type & DIDFT_INSTANCEMASK) | (object_type & 0xff)
+}
+
+fn find_object_record<'a>(
+    records: &'a [ObjectRecord],
+    guid_label: &str,
+) -> Result<&'a ObjectRecord> {
+    records
+        .iter()
+        .find(|record| record.guid == guid_label)
+        .ok_or_else(|| {
+            RemoteSteerError::Backend(format!("DirectInput object {guid_label} not found"))
+        })
+}
+
+fn exact_object_format(offset: u32, data_type: u32, flags: u32) -> DIOBJECTDATAFORMAT {
     DIOBJECTDATAFORMAT {
-        pguid: guid as *const GUID,
+        pguid: std::ptr::null(),
         dwOfs: offset,
         dwType: data_type,
         dwFlags: flags,
@@ -1124,23 +1286,119 @@ unsafe fn create_effect_with_params(
     out.ok_or_else(|| RemoteSteerError::Backend("DirectInput CreateEffect returned null".into()))
 }
 
-unsafe fn try_set_axis_range(
-    device: &IDirectInputDevice8W,
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct AxisRangeRequest {
+    axis: &'static str,
     offset: u32,
+    object_id: u32,
     minimum: i32,
     maximum: i32,
-) {
-    let _ = set_axis_range(device, offset, minimum, maximum);
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct AxisRangeDiagnostic {
+    axis: &'static str,
+    offset: u32,
+    object_id: u32,
+    minimum: i32,
+    maximum: i32,
+    success: bool,
+    method: Option<&'static str>,
+    error: Option<String>,
+}
+
+impl AxisRangeDiagnostic {
+    fn format(&self) -> String {
+        match &self.error {
+            Some(error) => format!(
+                "axis_range {} ofs=0x{:04x} id=0x{:08x} range={}..{}: ERROR {}",
+                self.axis, self.offset, self.object_id, self.minimum, self.maximum, error
+            ),
+            None => format!(
+                "axis_range {} ofs=0x{:04x} id=0x{:08x} range={}..{}: OK by {}",
+                self.axis,
+                self.offset,
+                self.object_id,
+                self.minimum,
+                self.maximum,
+                self.method.unwrap_or("unknown")
+            ),
+        }
+    }
+}
+
+impl fmt::Display for AxisRangeDiagnostic {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(&self.format())
+    }
+}
+
+unsafe fn configure_axis_ranges(
+    device: &IDirectInputDevice8W,
+    requests: &[AxisRangeRequest],
+) -> Vec<AxisRangeDiagnostic> {
+    requests
+        .iter()
+        .map(|request| {
+            match set_axis_range(
+                device,
+                DIPH_BYOFFSET,
+                request.offset,
+                request.minimum,
+                request.maximum,
+            ) {
+                Ok(()) => AxisRangeDiagnostic {
+                    axis: request.axis,
+                    offset: request.offset,
+                    object_id: request.object_id,
+                    minimum: request.minimum,
+                    maximum: request.maximum,
+                    success: true,
+                    method: Some("offset"),
+                    error: None,
+                },
+                Err(offset_err) => match set_axis_range(
+                    device,
+                    DIPH_BYID,
+                    request.object_id,
+                    request.minimum,
+                    request.maximum,
+                ) {
+                    Ok(()) => AxisRangeDiagnostic {
+                        axis: request.axis,
+                        offset: request.offset,
+                        object_id: request.object_id,
+                        minimum: request.minimum,
+                        maximum: request.maximum,
+                        success: true,
+                        method: Some("id"),
+                        error: None,
+                    },
+                    Err(id_err) => AxisRangeDiagnostic {
+                        axis: request.axis,
+                        offset: request.offset,
+                        object_id: request.object_id,
+                        minimum: request.minimum,
+                        maximum: request.maximum,
+                        success: false,
+                        method: None,
+                        error: Some(format!("offset: {offset_err}; id: {id_err}")),
+                    },
+                },
+            }
+        })
+        .collect()
 }
 
 unsafe fn set_axis_range(
     device: &IDirectInputDevice8W,
-    offset: u32,
+    how: u32,
+    object: u32,
     minimum: i32,
     maximum: i32,
 ) -> Result<()> {
     let mut property = DIPROPRANGE {
-        diph: property_header::<DIPROPRANGE>(DIPH_BYOFFSET, offset),
+        diph: property_header::<DIPROPRANGE>(how, object),
         lMin: minimum,
         lMax: maximum,
     };
@@ -1178,6 +1436,32 @@ fn property_header<T>(how: u32, object: u32) -> DIPROPHEADER {
     }
 }
 
+fn format_monitor_line(sample: u64, state: &DIJOYSTATE2) -> String {
+    let pressed = state
+        .rgbButtons
+        .iter()
+        .enumerate()
+        .filter_map(|(index, value)| {
+            if value & 0x80 != 0 {
+                Some(index.to_string())
+            } else {
+                None
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(",");
+    let pressed = if pressed.is_empty() {
+        "-".to_string()
+    } else {
+        pressed
+    };
+
+    format!(
+        "sample={} lX={} lY={} lRz={} slider0={} POV0={} buttons=[{}]",
+        sample, state.lX, state.lY, state.lRz, state.rglSlider[0], state.rgdwPOV[0], pressed
+    )
+}
+
 fn snapshot_from_dijoystate(seq: u64, state: &DIJOYSTATE2) -> WheelStateSnapshot {
     let (hat_x, hat_y) = pov_to_hat(state.rgdwPOV[0]);
     let buttons = (0..13)
@@ -1197,15 +1481,15 @@ fn snapshot_from_dijoystate(seq: u64, state: &DIJOYSTATE2) -> WheelStateSnapshot
             },
             AxisValue {
                 axis: AxisKind::PedalY,
-                value: state.lY,
+                value: direct_input_u8_axis(state.lY),
             },
             AxisValue {
                 axis: AxisKind::PedalRz,
-                value: state.lRz,
+                value: direct_input_u8_axis(state.lRz),
             },
             AxisValue {
                 axis: AxisKind::Throttle,
-                value: state.rglSlider[0],
+                value: direct_input_u8_axis(state.rglSlider[0]),
             },
             AxisValue {
                 axis: AxisKind::HatX,
@@ -1218,6 +1502,15 @@ fn snapshot_from_dijoystate(seq: u64, state: &DIJOYSTATE2) -> WheelStateSnapshot
         ],
         buttons,
     }
+}
+
+fn direct_input_u8_axis(value: i32) -> i32 {
+    if (0..=255).contains(&value) {
+        return value;
+    }
+
+    let value = value.clamp(0, u16::MAX as i32) as i64;
+    ((value * u8::MAX as i64) / u16::MAX as i64) as i32
 }
 
 fn pov_to_hat(value: u32) -> (i32, i32) {
@@ -1397,15 +1690,46 @@ mod tests {
     }
 
     #[test]
-    fn t150_data_format_uses_only_present_position_axes() {
-        let objects = joystick2_object_format();
-        let axis_objects: Vec<&DIOBJECTDATAFORMAT> = objects
-            .iter()
-            .filter(|object| object.dwType == DIDFT_AXIS_ANY_OPTIONAL)
-            .collect();
+    fn t150_snapshot_scales_default_directinput_pedal_ranges() {
+        let mut state = DIJOYSTATE2 {
+            lY: 32_767,
+            lRz: 65_535,
+            ..Default::default()
+        };
+        state.rglSlider[0] = -10;
 
-        assert_eq!(objects.len(), 136);
+        let snapshot = snapshot_from_dijoystate(7, &state);
+
+        assert_eq!(snapshot.axis(AxisKind::PedalY), Some(127));
+        assert_eq!(snapshot.axis(AxisKind::PedalRz), Some(255));
+        assert_eq!(snapshot.axis(AxisKind::Throttle), Some(0));
+    }
+
+    #[test]
+    fn t150_data_format_uses_enumerated_t150_objects() {
+        let mut records = vec![
+            test_object_record("GUID_XAxis", 0x0100_0002),
+            test_object_record("GUID_YAxis", 0x0000_0102),
+            test_object_record("GUID_RzAxis", 0x0000_0502),
+            test_object_record("GUID_Slider", 0x0000_0202),
+            test_object_record("GUID_POV", 0x0000_0010),
+        ];
+        for index in 0..13 {
+            records.push(test_object_record(
+                "GUID_Button",
+                0x0200_0004 + index as u32,
+            ));
+        }
+
+        let selection = t150_data_format_from_records(&records).unwrap();
+        let axis_objects = &selection.objects[..4];
+
+        assert_eq!(selection.objects.len(), 18);
         assert_eq!(axis_objects.len(), 4);
+        assert_eq!(axis_objects[0].dwType, 0x0000_0002);
+        assert_eq!(axis_objects[1].dwType, 0x0000_0102);
+        assert_eq!(axis_objects[2].dwType, 0x0000_0502);
+        assert_eq!(axis_objects[3].dwType, 0x0000_0202);
         assert_eq!(
             axis_objects[0].dwOfs,
             offset_u32(offset_of!(DIJOYSTATE2, lX))
@@ -1425,5 +1749,67 @@ mod tests {
         assert!(axis_objects
             .iter()
             .all(|object| object.dwFlags == DATA_FORMAT_ASPECT_POSITION));
+        assert_eq!(selection.range_requests[2].object_id, 0x0000_0502);
+        assert_eq!(
+            selection.objects[4].dwOfs,
+            offset_u32(offset_of!(DIJOYSTATE2, rgdwPOV))
+        );
+        assert_eq!(
+            selection.objects[5].dwOfs,
+            offset_u32(offset_of!(DIJOYSTATE2, rgbButtons))
+        );
+        assert_eq!(selection.objects[5].dwType, 0x0000_0004);
+    }
+
+    #[test]
+    fn monitor_line_formats_raw_t150_values() {
+        let mut state = DIJOYSTATE2 {
+            lX: 12,
+            lY: 34,
+            lRz: 56,
+            ..Default::default()
+        };
+        state.rglSlider[0] = 78;
+        state.rgdwPOV[0] = 9_000;
+        state.rgbButtons[1] = 0x80;
+        state.rgbButtons[12] = 0xff;
+
+        assert_eq!(
+            format_monitor_line(3, &state),
+            "sample=3 lX=12 lY=34 lRz=56 slider0=78 POV0=9000 buttons=[1,12]"
+        );
+    }
+
+    #[test]
+    fn axis_range_diagnostic_formats_failures() {
+        let diagnostic = AxisRangeDiagnostic {
+            axis: "lX",
+            offset: 0x20,
+            object_id: 0x0100_0002,
+            minimum: 0,
+            maximum: 65535,
+            success: false,
+            method: None,
+            error: Some("unsupported".to_string()),
+        };
+
+        assert_eq!(
+            diagnostic.format(),
+            "axis_range lX ofs=0x0020 id=0x01000002 range=0..65535: ERROR unsupported"
+        );
+    }
+
+    fn test_object_record(guid: &'static str, object_type: u32) -> ObjectRecord {
+        ObjectRecord {
+            offset: 0,
+            object_type,
+            flags: 0,
+            guid,
+            name: String::new(),
+            ff_max_force: 0,
+            ff_force_resolution: 0,
+            usage_page: 0,
+            usage: 0,
+        }
     }
 }

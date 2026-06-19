@@ -31,8 +31,6 @@ pub struct LinuxPhysicalBackend {
 pub struct LinuxVirtualBackend {
     handle: UInputHandle<File>,
     profile: remote_steer_core::WheelProfile,
-    pending_uploads: HashMap<u64, sys::uinput_ff_upload>,
-    pending_erases: HashMap<u64, sys::uinput_ff_erase>,
     pending_commands: VecDeque<FfbCommand>,
     next_command_seq: u64,
     last_axes: HashMap<AxisKind, i32>,
@@ -105,7 +103,7 @@ impl LinuxVirtualBackend {
                 Ok(AbsoluteInfoSetup {
                     axis: axis_from_linux_code(axis.linux_code)?,
                     info: AbsoluteInfo {
-                        value: 0,
+                        value: initial_abs_value(axis),
                         minimum: axis.minimum,
                         maximum: axis.maximum,
                         fuzz: axis.fuzz,
@@ -125,8 +123,6 @@ impl LinuxVirtualBackend {
         Ok(Self {
             handle,
             profile,
-            pending_uploads: HashMap::new(),
-            pending_erases: HashMap::new(),
             pending_commands: VecDeque::new(),
             next_command_seq: 0,
             last_axes: HashMap::new(),
@@ -226,7 +222,8 @@ impl VirtualWheelBackend for LinuxVirtualBackend {
                         effect_type = upload.effect.type_,
                         "uinput ff upload begin completed"
                     );
-                    self.pending_uploads.insert(command_id, upload);
+                    upload.retval = 0;
+                    self.handle.ff_upload_end(&upload)?;
                     self.pending_commands.push_back(FfbCommand {
                         command_id,
                         kind: FfbCommandKind::Upload { effect },
@@ -245,7 +242,8 @@ impl VirtualWheelBackend for LinuxVirtualBackend {
                         effect_id = erase.effect_id,
                         "uinput ff erase begin completed"
                     );
-                    self.pending_erases.insert(command_id, erase);
+                    erase.retval = 0;
+                    self.handle.ff_erase_end(&erase)?;
                     self.pending_commands.push_back(FfbCommand {
                         command_id,
                         kind: FfbCommandKind::Erase { effect_id },
@@ -295,28 +293,11 @@ impl VirtualWheelBackend for LinuxVirtualBackend {
     }
 
     fn complete_ffb(&mut self, reply: FfbReply) -> Result<()> {
-        let retval = match &reply.kind {
-            FfbReplyKind::Ack => 0,
-            FfbReplyKind::Rejected { .. } => -1,
-        };
-        if let Some(mut upload) = self.pending_uploads.remove(&reply.command_id) {
-            upload.retval = retval;
-            debug!(
-                command_id = reply.command_id,
-                retval, "uinput ff upload completing"
-            );
-            self.handle.ff_upload_end(&upload)?;
-            return Ok(());
-        }
-        if let Some(mut erase) = self.pending_erases.remove(&reply.command_id) {
-            erase.retval = retval;
-            debug!(
-                command_id = reply.command_id,
-                retval, "uinput ff erase completing"
-            );
-            self.handle.ff_erase_end(&erase)?;
-            return Ok(());
-        }
+        debug!(
+            command_id = reply.command_id,
+            kind = ?reply.kind,
+            "remote ffb reply received"
+        );
         Ok(())
     }
 }
@@ -368,6 +349,15 @@ fn input_events_for_snapshot(
         events.push(raw_event(sys::EV_SYN as u16, sys::SYN_REPORT as u16, 0));
     }
     Ok(events)
+}
+
+fn initial_abs_value(axis: &remote_steer_core::AxisProfile) -> i32 {
+    match axis.kind {
+        AxisKind::Wheel => axis.minimum + (axis.maximum - axis.minimum) / 2,
+        AxisKind::PedalY | AxisKind::PedalRz | AxisKind::Throttle => axis.maximum,
+        AxisKind::HatX | AxisKind::HatY => 0,
+    }
+    .clamp(axis.minimum, axis.maximum)
 }
 
 pub fn probe_t150_event() -> Result<Option<LinuxEventProbe>> {
@@ -790,8 +780,9 @@ fn condition_kind_to_sys(condition: ConditionKind) -> u16 {
 #[cfg(test)]
 mod tests {
     use super::{
-        input_events_for_snapshot, next_namespaced_command_id, sys, COMMAND_NAMESPACE_ERASE,
-        COMMAND_NAMESPACE_INLINE, COMMAND_NAMESPACE_PAYLOAD_MASK, COMMAND_NAMESPACE_UPLOAD,
+        initial_abs_value, input_events_for_snapshot, next_namespaced_command_id, sys,
+        COMMAND_NAMESPACE_ERASE, COMMAND_NAMESPACE_INLINE, COMMAND_NAMESPACE_PAYLOAD_MASK,
+        COMMAND_NAMESPACE_UPLOAD,
     };
     use remote_steer_core::{
         profile_by_id, AxisKind, AxisValue, ButtonValue, WheelProfileId, WheelStateSnapshot,
@@ -825,6 +816,23 @@ mod tests {
             COMMAND_NAMESPACE_UPLOAD | COMMAND_NAMESPACE_PAYLOAD_MASK
         );
         assert_eq!(wrapped_payload, COMMAND_NAMESPACE_UPLOAD);
+    }
+
+    #[test]
+    fn initial_abs_values_are_sane_for_t150() {
+        let profile = profile_by_id(WheelProfileId::T150);
+        let values = profile
+            .axes
+            .iter()
+            .map(|axis| (axis.kind, initial_abs_value(axis)))
+            .collect::<HashMap<_, _>>();
+
+        assert_eq!(values[&AxisKind::Wheel], 32767);
+        assert_eq!(values[&AxisKind::PedalY], 255);
+        assert_eq!(values[&AxisKind::PedalRz], 255);
+        assert_eq!(values[&AxisKind::Throttle], 255);
+        assert_eq!(values[&AxisKind::HatX], 0);
+        assert_eq!(values[&AxisKind::HatY], 0);
     }
 
     #[test]

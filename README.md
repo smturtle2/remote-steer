@@ -98,8 +98,8 @@ Download the latest release from
 
 For this release, use:
 
-- `remote-steer-v0.0.2-windows-x86_64.zip` on the Windows wheel machine
-- `remote-steer-v0.0.2-linux-x86_64.tar.gz` on the Linux game machine
+- `remote-steer-v0.0.3-windows-x86_64.zip` on the Windows wheel machine
+- `remote-steer-v0.0.3-linux-x86_64.tar.gz` on the Linux game machine
 - `SHA256SUMS` to verify downloaded files
 
 Build from source:
@@ -126,6 +126,7 @@ remote-steer test
 remote-steer test --effect engine
 remote-steer probe physical
 remote-steer probe virtual
+remote-steer monitor physical
 remote-steer dump-direct-input
 ```
 

@@ -97,8 +97,8 @@ Spring과 damper는 condition effect라서 휠이 스스로 튀는 효과가 아
 
 이번 릴리즈에서는 다음 파일을 사용합니다:
 
-- Windows 휠 PC: `remote-steer-v0.0.2-windows-x86_64.zip`
-- Linux 게임 PC: `remote-steer-v0.0.2-linux-x86_64.tar.gz`
+- Windows 휠 PC: `remote-steer-v0.0.3-windows-x86_64.zip`
+- Linux 게임 PC: `remote-steer-v0.0.3-linux-x86_64.tar.gz`
 - 다운로드 검증: `SHA256SUMS`
 
 소스에서 빌드:
@@ -125,6 +125,7 @@ remote-steer test
 remote-steer test --effect engine
 remote-steer probe physical
 remote-steer probe virtual
+remote-steer monitor physical
 remote-steer dump-direct-input
 ```
 

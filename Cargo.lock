@@ -365,7 +365,7 @@ checksum = "d6f6ff9a378485b298a5286656da665ba74413d36db0979633275d2e708145d4"
 
 [[package]]
 name = "remote-steer"
-version = "0.0.2"
+version = "0.0.3"
 dependencies = [
  "anyhow",
  "clap",
@@ -383,7 +383,7 @@ dependencies = [
 
 [[package]]
 name = "remote-steer-backend-linux"
-version = "0.0.2"
+version = "0.0.3"
 dependencies = [
  "input-linux",
  "libc",
@@ -393,7 +393,7 @@ dependencies = [
 
 [[package]]
 name = "remote-steer-backend-windows"
-version = "0.0.2"
+version = "0.0.3"
 dependencies = [
  "remote-steer-core",
  "windows",
@@ -401,7 +401,7 @@ dependencies = [
 
 [[package]]
 name = "remote-steer-core"
-version = "0.0.2"
+version = "0.0.3"
 dependencies = [
  "serde",
  "thiserror",
@@ -409,7 +409,7 @@ dependencies = [
 
 [[package]]
 name = "remote-steer-transport"
-version = "0.0.2"
+version = "0.0.3"
 dependencies = [
  "bincode",
  "blake3",
